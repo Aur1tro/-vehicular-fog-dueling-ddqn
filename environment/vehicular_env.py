@@ -1,44 +1,37 @@
 """
 vehicular_env.py — OpenAI-Gym-style environment for the Vehicular Fog Network.
 
-The environment simulates N vehicles that move according to a constant-speed
-mobility model and offload tasks to one RSU.  The RL agent decides how to
-allocate the offloading rate λ to each vehicle at every time-step.
+Redesigned to match the ICC paper:
+"Optimizing AoI in Mobility-Based Vehicular Fog Networks: A Dueling-DDQN Approach"
+
+KEY DESIGN (matches the paper's formulation)
+---------------------------------------------
+The RL agent selects a *rate-allocation level* for all active vehicles at
+each time-step.  The level determines the target per-vehicle λ; the
+environment then enforces the aggregate service constraint Σλ_i ≤ μ by
+proportional scaling.
+
+Action space: K discrete levels (e.g., K=10).
+  - Each level maps to a target per-vehicle λ from the palette.
+  - Active vehicles (within coverage) all receive that λ.
+  - If total λ exceeds μ, all rates are scaled down proportionally.
+
+This keeps the action space small (K=10) so the agent can learn effectively,
+while still capturing the key trade-off: higher λ → lower AoI but risk
+violating the service constraint when many vehicles are active.
 
 State  (observation)
 -----
 A flat vector of size 3·N containing, for each vehicle:
-    • normalised distance to the RSU  (d_i / d_max)
+    • normalised distance to the RSU  (d_i / d_max, clipped to [0, 2])
     • participation flag              (1 if d_i ≤ d_max, else 0)
-    • current AoI                     (Δ_i / Δ_threshold, clipped to [0,1])
-
-Action
-------
-A single discrete integer in [0, K^N_active) that encodes a *combination*
-of λ-levels for participating vehicles.
-
-To keep the action space tractable (exponential blow-up with N), we use a
-simplified scheme:
-
-    action ∈ {0, 1, …, K·N − 1}
-
-Interpretation:
-    vehicle_index = action // K
-    lambda_level  = action %  K
-
-The selected vehicle gets the chosen λ; all other participating vehicles
-receive a baseline rate (e.g., μ / |S|) to avoid infinite AoI.
+    • normalised current AoI          (Δ_i / Δ_threshold, clipped to [0, 2])
 
 Reward
 ------
-    r = 1 / avg_AoI
+    r = -avg_AoI + bonus_if_below_threshold - penalty_for_violations
 
-Higher is better — encourages the agent to minimise average AoI.
-A small penalty is added if any vehicle exceeds Δ_threshold.
-
-Episode termination
--------------------
-After T = max_steps_per_episode time-steps.
+Higher (less negative) is better — encourages the agent to minimise AoI.
 
 Reference
 ---------
@@ -84,13 +77,16 @@ class VehicularFogEnv:
         self.rsu_pos = np.array(self.cfg.rsu_positions[0])
 
         # Discrete λ palette: shape (K,)
-        self.lambda_levels = self.cfg.lambda_levels  # 0 … μ
+        self.lambda_levels = self.cfg.lambda_levels
 
         # ── Action & observation dimensions ──────────────────────────────
         self.K = self.cfg.num_lambda_levels
         self.N = self.cfg.num_vehicles
-        self.action_dim = self.N * self.K          # flat discrete space
-        self.state_dim = self.N * 3                # 3 features per vehicle
+
+        # Action space: K levels — agent picks a target λ applied to all
+        # active vehicles, subject to the Σλ ≤ μ constraint
+        self.action_dim = self.K
+        self.state_dim = self.N * 3  # 3 features per vehicle
 
         # ── Per-vehicle AoI tracking ─────────────────────────────────────
         self.current_aoi = np.zeros(self.N)
@@ -115,26 +111,26 @@ class VehicularFogEnv:
         self.current_step = 0
         self.done = False
 
-        # Initial AoI is high (no information received yet)
-        self.current_aoi = np.full(self.N, self.cfg.aoi_threshold)
+        # Initial AoI — moderate starting value
+        self.current_aoi = np.ones(self.N) * 1.0
 
         # Compute initial distances & participation
         distances = self.mobility.distances_to(self.rsu_pos)
         participation = (distances <= self.cfg.coverage_radius).astype(float)
 
-        # Give participating vehicles a fair baseline λ
+        # Give participating vehicles a fair baseline λ = μ / n_active
         n_active = max(int(participation.sum()), 1)
         base_lambda = self.cfg.mu / n_active
         self.current_lambdas = participation * base_lambda
 
         # Compute initial AoI per vehicle
         for i in range(self.N):
-            if participation[i]:
+            if participation[i] and self.current_lambdas[i] > 0:
                 self.current_aoi[i] = compute_aoi(
                     self.current_lambdas[i], self.cfg.mu, self.cfg.epsilon_error
                 )
             else:
-                self.current_aoi[i] = self.cfg.aoi_threshold  # out of range
+                self.current_aoi[i] = self.cfg.aoi_threshold
 
         return self._build_state(distances, participation)
 
@@ -148,24 +144,19 @@ class VehicularFogEnv:
         Parameters
         ----------
         action : int
-            Index into the flat action space [0, N·K).
-            Encodes *which vehicle* and *which λ level*.
+            Index into [0, K): selects a λ-level for all active vehicles.
 
         Returns
         -------
         state  : np.ndarray   — next observation
-        reward : float         — 1 / avg_AoI (higher = better)
+        reward : float         — shaped reward (higher = better)
         done   : bool          — True when episode ends
         info   : dict          — diagnostics (avg_aoi, per-vehicle AoI, etc.)
         """
         self.current_step += 1
 
         # ── 1. Decode the action ─────────────────────────────────────────
-        vehicle_idx = action // self.K
-        lambda_level = action % self.K
-
-        # Safety: clamp vehicle index
-        vehicle_idx = min(vehicle_idx, self.N - 1)
+        target_lambda = self.lambda_levels[min(action, self.K - 1)]
 
         # ── 2. Move vehicles ─────────────────────────────────────────────
         self.mobility.step()
@@ -174,20 +165,19 @@ class VehicularFogEnv:
 
         # ── 3. Assign λ values ───────────────────────────────────────────
         n_active = max(int(participation.sum()), 1)
-        # Baseline: spread RSU capacity equally among active vehicles
-        base_lambda = self.cfg.mu / (n_active + 1)  # +1 reserves room for agent's pick
-        self.current_lambdas = participation * base_lambda
 
-        # Agent's chosen vehicle gets the specific λ (if in range)
-        chosen_lambda = self.lambda_levels[lambda_level]
-        if participation[vehicle_idx]:
-            self.current_lambdas[vehicle_idx] = chosen_lambda
+        # Each active vehicle gets the target λ from the chosen level
+        self.current_lambdas = participation * target_lambda
 
-        # Enforce service constraint: total λ ≤ μ per RSU
+        # Enforce service constraint: Σλ_i ≤ μ
         total_lambda = self.current_lambdas.sum()
         if total_lambda > self.cfg.mu and total_lambda > 0:
-            # Scale down proportionally
             self.current_lambdas *= self.cfg.mu / total_lambda
+
+        # Ensure a minimum λ for active vehicles to avoid 1/λ blow-up
+        for i in range(self.N):
+            if participation[i] and self.current_lambdas[i] < 0.05:
+                self.current_lambdas[i] = 0.05
 
         # ── 4. Compute AoI for each vehicle ──────────────────────────────
         threshold_violations = 0
@@ -197,9 +187,10 @@ class VehicularFogEnv:
                     self.current_lambdas[i], self.cfg.mu, self.cfg.epsilon_error
                 )
             else:
-                # Vehicle out of range or λ=0 → AoI grows linearly
+                # Vehicle out of range → AoI grows (stale information)
                 self.current_aoi[i] = min(
-                    self.current_aoi[i] + 1.0, self.cfg.aoi_threshold * 2
+                    self.current_aoi[i] + 0.5,
+                    self.cfg.aoi_threshold * 2
                 )
 
             if not check_threshold(self.current_aoi[i], self.cfg.aoi_threshold):
@@ -211,11 +202,15 @@ class VehicularFogEnv:
             participation_mask=participation.astype(bool),
         )
 
-        # Reward: inverse of average AoI (higher reward ↔ lower AoI)
-        reward = 1.0 / max(avg_aoi, 1e-6)
+        # Primary reward: negative AoI (agent minimises AoI)
+        reward = -avg_aoi
 
-        # Penalise threshold violations to steer the agent toward feasibility
-        reward -= 0.1 * threshold_violations
+        # Bonus for staying below threshold
+        if avg_aoi < self.cfg.aoi_threshold:
+            reward += 1.0
+
+        # Small penalty for per-vehicle threshold violations
+        reward -= 0.05 * threshold_violations
 
         # ── 6. Check termination ─────────────────────────────────────────
         self.done = self.current_step >= self.cfg.max_steps_per_episode
@@ -243,11 +238,11 @@ class VehicularFogEnv:
         """Construct a flat observation vector of size 3·N.
 
         Features per vehicle (i):
-            [0] normalised distance  d_i / d_max
+            [0] normalised distance  d_i / d_max  (clipped to [0, 2])
             [1] participation flag   1{d_i ≤ d_max}
-            [2] normalised AoI       clip(Δ_i / Δ_thresh, 0, 1)
+            [2] normalised AoI       clip(Δ_i / Δ_thresh, 0, 2)
         """
-        norm_dist = distances / self.cfg.coverage_radius  # may exceed 1
+        norm_dist = np.clip(distances / self.cfg.coverage_radius, 0.0, 2.0)
         norm_aoi = np.clip(self.current_aoi / self.cfg.aoi_threshold, 0.0, 2.0)
 
         state = np.stack([norm_dist, participation, norm_aoi], axis=1).flatten()

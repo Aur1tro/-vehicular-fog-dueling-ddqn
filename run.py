@@ -32,13 +32,15 @@ def main() -> None:
 
     print(f"Device: {cfg.device}")
     print(f"Vehicles: {cfg.num_vehicles}, Episodes: {cfg.num_episodes}")
-    print(f"Action dim: {cfg.num_vehicles * cfg.num_lambda_levels}")
+    print(f"mu: {cfg.mu}, epsilon_error: {cfg.epsilon_error}")
     print("=" * 60)
 
     # Create environment (shared config)
     env = VehicularFogEnv(cfg)
     state_dim = env.state_dim
     action_dim = env.action_dim
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
+    print(f"Lambda levels: {cfg.lambda_levels}")
 
     # Instantiate all four agents
     agents = [

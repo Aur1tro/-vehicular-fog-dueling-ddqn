@@ -64,14 +64,14 @@ def compute_aoi(
       • λ/(μ(λ+μ))        — queueing delay correction factor
     """
     # Guard against degenerate cases
-    if lambda_i <= 0:
+    if lambda_i <= 1e-6:
         # Vehicle is not being served → AoI is effectively infinite;
         # return a large but finite penalty so gradients stay bounded.
-        return 1000.0
+        return 100.0
 
-    if lambda_i > mu:
-        # Violates service constraint → penalise heavily
-        return 1000.0
+    if lambda_i > mu * 1.01:  # small tolerance for floating-point
+        # Violates service constraint → penalise
+        return 100.0
 
     one_minus_eps = 1.0 - epsilon  # (1 − ε)
 
@@ -114,7 +114,7 @@ def compute_average_aoi(
     active = np.where(participation_mask)[0]
     if len(active) == 0:
         # No vehicle in range — worst case
-        return 1000.0
+        return 100.0
 
     aoi_values = np.array(
         [compute_aoi(lambdas[i], mu, epsilon) for i in active]
